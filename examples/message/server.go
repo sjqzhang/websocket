@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	mapset "github.com/deckarep/golang-set"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/sjqzhang/bus"
+	"gopkg.in/natefinch/lumberjack.v2"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -12,15 +17,12 @@ import (
 	"runtime"
 	"sync"
 	"time"
-
-	mapset "github.com/deckarep/golang-set"
-	"github.com/gorilla/websocket"
-	"github.com/sjqzhang/bus"
 )
 
 const WEBSOCKET_MESSAGE = "WEBSOCKET_MESSAGE"
 
 var hubLocal = newHub()
+var logger *log.Logger
 
 func init() {
 
@@ -81,11 +83,8 @@ func (h *hub) SendMessage(subscription Subscription) {
 
 func (h *hub) Run() {
 	for {
-		fmt.Println("Cardinality conn", h.conns.Cardinality())
-		if m, ok := h.subs.Load("topicA_$_1"); ok {
-			fmt.Println("Cardinality", m.(mapset.Set).Cardinality())
-		}
-		time.Sleep(time.Second)
+		logger.Println("Goroutines", runtime.NumGoroutine(), "Cardinality", h.conns.Cardinality())
+		time.Sleep(time.Second*10)
 	}
 }
 
@@ -134,33 +133,6 @@ func (h *hub) RemoveFailedConn(conn *websocket.Conn) {
 	}()
 }
 
-// 存储所有订阅的连接和订阅消息
-var subscriptions = struct {
-	sync.RWMutex
-	conns map[*websocket.Conn]Subscription
-}{
-	conns: make(map[*websocket.Conn]Subscription),
-}
-
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-
-	defer func() {
-		if err := recover(); err != nil {
-			fmt.Println(err)
-		}
-	}()
-	// 升级HTTP连接为WebSocket连接
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("Failed to upgrade connection:", err)
-		return
-	}
-
-	// 处理WebSocket连接
-	go readMessages(conn)
-	//go handleMessages(conn)
-}
-
 func readMessages(conn *websocket.Conn) {
 
 	defer func() {
@@ -186,18 +158,17 @@ func readMessages(conn *websocket.Conn) {
 			return
 		case websocket.PingMessage:
 			conn.WriteMessage(websocket.PongMessage, nil)
-			fmt.Println("messageType", messageType, "message", message)
 		case websocket.TextMessage:
 			// 解析订阅消息
 			var subscription Subscription
 			err = json.Unmarshal(message, &subscription)
 			if err != nil {
-				fmt.Println("Failed to parse subscription message:", err)
+				logger.Println("Failed to parse subscription message:", err)
 				continue
 			}
 			handleMessages(conn, subscription)
 
-			fmt.Println("messageType", messageType, "message", message)
+			logger.Println("messageType", messageType, "message", message)
 
 		}
 
@@ -208,82 +179,58 @@ func handleMessages(conn *websocket.Conn, subscription Subscription) {
 	hubLocal.Subscribe(conn, subscription)
 } // 获取订阅
 
-func serveApi(w http.ResponseWriter, r *http.Request) {
-
-	//get body message
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	var subscription Subscription
-	err = json.Unmarshal(body, &subscription)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	//hubLocal.SendMessage(subscription)
-	bus.Publish(WEBSOCKET_MESSAGE, subscription)
-	w.Write([]byte("ok"))
-}
-
-func serveHome(w http.ResponseWriter, r *http.Request) {
-	log.Println(r.URL)
-	if r.URL.Path != "/" {
-		http.Error(w, "Not found", http.StatusNotFound)
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	http.ServeFile(w, r, "home.html")
-}
-
 var addr = flag.String("addr", ":8866", "http service address")
 
 func main() {
 
-	go func() {
-		for {
-
-			time.Sleep(1 * time.Second)
-			fmt.Println(runtime.NumGoroutine())
-
-		}
-	}()
-
+	logFile := &lumberjack.Logger{
+		Filename:   "gin.log", // 日志文件名称
+		MaxSize:    100,       // 每个日志文件的最大大小（以MB为单位）
+		MaxBackups: 5,         // 保留的旧日志文件的最大个数
+		MaxAge:     30,        // 保留的旧日志文件的最大天数
+		Compress:   true,      // 是否压缩旧的日志文件
+	}
+	logger = log.New(logFile, "[WS] ", log.LstdFlags)
 	go hubLocal.Run()
-
-	go func() {
-		for {
-			bus.Publish(WEBSOCKET_MESSAGE, Subscription{
-				Action:  "subscribe",
-				Topic:   "topicA",
-				ID:      "123",
-				Message: "hello",
-			})
-			time.Sleep(1 * time.Second)
+	router := gin.Default()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		Output: logFile,
+	}))
+	gin.DefaultErrorWriter = logFile
+	wd, _ := os.Getwd()
+	os.Chdir(wd + "/examples/message")
+	router.GET("/", func(c *gin.Context) {
+		body, err := ioutil.ReadFile("home.html")
+		if err != nil {
+			logger.Println(err)
+			return
 		}
-	}()
+		c.Writer.Write(body)
 
-	os.Chdir("examples/message")
-	fmt.Println(os.Getwd())
-	flag.Parse()
-
-	http.HandleFunc("/", serveHome)
-
-	http.HandleFunc("/wsapi", serveApi)
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		wsHandler(w, r)
 	})
-	server := &http.Server{
-		Addr:              *addr,
-		ReadHeaderTimeout: 3 * time.Second,
-	}
-	err := server.ListenAndServe()
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
-	}
+
+	router.GET("/ws", func(c *gin.Context) {
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			logger.Println("Failed to upgrade connection:", err)
+			return
+		}
+		go readMessages(conn)
+	})
+	router.POST("/wsapi", func(c *gin.Context) {
+
+		var subscription Subscription
+		err := c.BindJSON(&subscription)
+		if err != nil {
+			logger.Println("Failed to parse subscription message:", err)
+			return
+		}
+		logger.Println(fmt.Sprintf("订阅消息：%s", subscription))
+		bus.Publish(WEBSOCKET_MESSAGE, subscription)
+		c.JSON(http.StatusOK, subscription)
+
+	})
+
+	router.Run(*addr)
+
 }
