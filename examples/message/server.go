@@ -24,7 +24,7 @@ var hubLocal = newHub()
 
 func init() {
 
-	bus.Subscribe(WEBSOCKET_MESSAGE, 3, func(ctx context.Context, message interface{}) {
+	bus.Subscribe(WEBSOCKET_MESSAGE, 50, func(ctx context.Context, message interface{}) {
 		if message == nil {
 			return
 		}
@@ -62,7 +62,7 @@ func newHub() *hub {
 }
 
 func (h *hub) SendMessage(subscription Subscription) {
-	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
+	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		for _, conn := range m.(mapset.Set).ToSlice() {
 			conn.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
@@ -82,7 +82,7 @@ func (h *hub) SendMessage(subscription Subscription) {
 func (h *hub) Run() {
 	for {
 		fmt.Println("Cardinality conn", h.conns.Cardinality())
-		if m, ok := h.subs.Load("topicA$1"); ok {
+		if m, ok := h.subs.Load("topicA_$_1"); ok {
 			fmt.Println("Cardinality", m.(mapset.Set).Cardinality())
 		}
 		time.Sleep(time.Second)
@@ -90,7 +90,7 @@ func (h *hub) Run() {
 }
 
 func (h *hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
-	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
+	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Add(conn)
 		h.subs.Store(key, m)
@@ -104,7 +104,7 @@ func (h *hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
 
 // unsubscribe from a topic
 func (h *hub) Unsubscribe(conn *websocket.Conn, subscription Subscription) {
-	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
+	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Remove(conn)
 		if m.(mapset.Set).Cardinality() == 0 {
