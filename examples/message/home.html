@@ -41,7 +41,13 @@ window.onload = function () {
     };
 
     if (window["WebSocket"]) {
-        conn = new WebSocket("ws://" + document.location.host + "/ws");
+        //from url parameter get host ,example: 127.0.0.1:8080?host=127.0.0.1
+        var host = window.location.search.split("=")[1];
+        if (host) {
+          conn = new WebSocket("wss://" + host + "/ws");
+        } else {
+          conn = new WebSocket("ws://" + document.location.host + "/ws");
+        }
         // conn.send('Hello, world!');
       // debugger
         conn.onclose = function (evt) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -19,7 +20,7 @@ import (
 
 const WEBSOCKET_MESSAGE = "WEBSOCKET_MESSAGE"
 
-var hub = NewHub()
+var hubLocal = newHub()
 
 func init() {
 
@@ -28,7 +29,7 @@ func init() {
 			return
 		}
 		if v, ok := message.(Subscription); ok {
-			hub.SendMessage(v)
+			hubLocal.SendMessage(v)
 		}
 	})
 }
@@ -48,27 +49,47 @@ type Subscription struct {
 	Message interface{} `json:"message"`
 }
 
-type Hub struct {
-	subs sync.Map
+type hub struct {
+	subs  sync.Map
+	conns mapset.Set
 }
 
-func NewHub() *Hub {
-	return &Hub{
-		subs: sync.Map{},
+func newHub() *hub {
+	return &hub{
+		subs:  sync.Map{},
+		conns: mapset.NewSet(),
 	}
 }
 
-func (h *Hub) SendMessage(subscription Subscription) {
-	key:=fmt.Sprintf("%s$%s",subscription.Topic,subscription.ID)
+func (h *hub) SendMessage(subscription Subscription) {
+	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
-		for conn:= range m.(mapset.Set).Iter() {
-			conn.(*websocket.Conn).WriteJSON(subscription)
+		for _, conn := range m.(mapset.Set).ToSlice() {
+			conn.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := conn.(*websocket.Conn).WriteJSON(subscription)
+			if err != nil {
+				if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
+					h.Unsubscribe(conn.(*websocket.Conn), subscription)
+					h.RemoveFailedConn(conn.(*websocket.Conn))
+				}
+			}
+
 		}
 	}
 
 }
 
-func (h *Hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
+func (h *hub) Run() {
+	for {
+		fmt.Println("Cardinality conn", h.conns.Cardinality())
+		if m, ok := h.subs.Load("topicA$1"); ok {
+			fmt.Println("Cardinality", m.(mapset.Set).Cardinality())
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (h *hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
 	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Add(conn)
@@ -78,15 +99,39 @@ func (h *Hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
 		m.Add(conn)
 		h.subs.Store(key, m)
 	}
+	h.conns.Add(conn)
 }
 
 // unsubscribe from a topic
-func (h *Hub) Unsubscribe(conn *websocket.Conn, subscription Subscription) {
+func (h *hub) Unsubscribe(conn *websocket.Conn, subscription Subscription) {
 	key := fmt.Sprintf("%s$%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Remove(conn)
-		h.subs.Store(key, m)
+		if m.(mapset.Set).Cardinality() == 0 {
+			h.subs.Delete(key)
+		} else {
+			h.subs.Store(key, m)
+		}
 	}
+}
+
+// unsubscribe from a topic
+func (h *hub) RemoveFailedConn(conn *websocket.Conn) {
+	go func() {
+		h.subs.Range(func(key, value interface{}) bool {
+			for _, con := range value.(mapset.Set).ToSlice() {
+				c := con.(*websocket.Conn)
+				if c == conn {
+					if m, ok := h.subs.Load(key); ok {
+						m.(mapset.Set).Remove(conn)
+						h.subs.Store(key, m)
+					}
+				}
+			}
+			return true
+		})
+		h.conns.Remove(conn)
+	}()
 }
 
 // 存储所有订阅的连接和订阅消息
@@ -97,63 +142,17 @@ var subscriptions = struct {
 	conns: make(map[*websocket.Conn]Subscription),
 }
 
-// 处理订阅消息的接口
-type SubscriptionHandler interface {
-	Handle(conn *websocket.Conn, subscription Subscription)
-}
-
-// TopicA处理器
-type TopicAHandler struct{}
-
-func (h *TopicAHandler) Handle(conn *websocket.Conn, subscription Subscription) {
-
-	for {
-		err := conn.WriteJSON(map[string]string{
-			"topic": subscription.Topic,
-			"id":    subscription.ID,
-		})
-		if err != nil {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-
-	return
-}
-
-// TopicB处理器
-type TopicBHandler struct{}
-
-func (h *TopicBHandler) Handle(conn *websocket.Conn, subscription Subscription) {
-	// 在这里实现TopicB的处理逻辑
-	for {
-		err := conn.WriteJSON(map[string]string{
-			"topic": subscription.Topic,
-			"id":    subscription.ID,
-		})
-		if err != nil {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-	log.Printf("TopicB: Received message for topic %s, ID %s\n", subscription.Topic, subscription.ID)
-	// TODO: 根据topic+id确定唯一的对象是否发生变化，如果发生变化，将消息推送给前端
-
-	// 返回处理结果给前端
-	return
-}
-
-// 订阅消息处理器映射表
-var subscriptionHandlers = map[string]SubscriptionHandler{
-	"topicA": &TopicAHandler{},
-	"topicB": &TopicBHandler{},
-}
-
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println(err)
+		}
+	}()
 	// 升级HTTP连接为WebSocket连接
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Failed to upgrade connection:", err)
+		fmt.Println("Failed to upgrade connection:", err)
 		return
 	}
 
@@ -163,12 +162,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func readMessages(conn *websocket.Conn) {
-	defer conn.Close()
 
+	defer func() {
+		if err := recover(); err != nil {
+			hubLocal.RemoveFailedConn(conn)
+		}
+	}()
+	defer conn.Close()
 	for {
 		// 读取客户端发来的消息
 		//conn.SetReadDeadline(time.Now().Add(time.Second * 10))
 		messageType, message, err := conn.ReadMessage()
+		if err != nil {
+			if _, ok := err.(*websocket.CloseError); ok {
+				hubLocal.RemoveFailedConn(conn)
+				return
+			}
+		}
 
 		switch messageType {
 
@@ -176,17 +186,18 @@ func readMessages(conn *websocket.Conn) {
 			return
 		case websocket.PingMessage:
 			conn.WriteMessage(websocket.PongMessage, nil)
+			fmt.Println("messageType", messageType, "message", message)
 		case websocket.TextMessage:
 			// 解析订阅消息
 			var subscription Subscription
 			err = json.Unmarshal(message, &subscription)
 			if err != nil {
-				log.Println("Failed to parse subscription message:", err)
+				fmt.Println("Failed to parse subscription message:", err)
 				continue
 			}
 			handleMessages(conn, subscription)
 
-			log.Println("messageType", messageType, "message", message)
+			fmt.Println("messageType", messageType, "message", message)
 
 		}
 
@@ -194,24 +205,27 @@ func readMessages(conn *websocket.Conn) {
 }
 
 func handleMessages(conn *websocket.Conn, subscription Subscription) {
-
-
-	hub.Subscribe(conn, subscription)
-
-	//subscriptions.RLock()
-	//subscription := subscriptions.conns[conn]
-	//subscriptions.RUnlock()
-
-	//handler, ok := subscriptionHandlers[subscription.Topic]
-	//if !ok {
-	//	log.Println("Unsupported topic:", subscription.Topic)
-	//	return
-	//}
-	//
-	//// 调用处理器处理订阅消息
-	//handler.Handle(conn, subscription)
-
+	hubLocal.Subscribe(conn, subscription)
 } // 获取订阅
+
+func serveApi(w http.ResponseWriter, r *http.Request) {
+
+	//get body message
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	var subscription Subscription
+	err = json.Unmarshal(body, &subscription)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	//hubLocal.SendMessage(subscription)
+	bus.Publish(WEBSOCKET_MESSAGE, subscription)
+	w.Write([]byte("ok"))
+}
 
 func serveHome(w http.ResponseWriter, r *http.Request) {
 	log.Println(r.URL)
@@ -226,7 +240,7 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "home.html")
 }
 
-var addr = flag.String("addr", ":8080", "http service address")
+var addr = flag.String("addr", ":8866", "http service address")
 
 func main() {
 
@@ -239,6 +253,7 @@ func main() {
 		}
 	}()
 
+	go hubLocal.Run()
 
 	go func() {
 		for {
@@ -257,6 +272,8 @@ func main() {
 	flag.Parse()
 
 	http.HandleFunc("/", serveHome)
+
+	http.HandleFunc("/wsapi", serveApi)
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		wsHandler(w, r)
