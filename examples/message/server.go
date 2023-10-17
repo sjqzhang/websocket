@@ -217,6 +217,45 @@ func main() {
 		}
 		go readMessages(conn)
 	})
+
+	router.POST("/ws/noc_incident", func(c *gin.Context) {
+
+
+		type NocIncident struct {
+			ID                int       `json:"id"`
+			IncidentID        string    `json:"incident_id"`
+			Title             string    `json:"title"`
+			StartTime         int64     `json:"start_time"`
+			EndTime           int64     `json:"end_time"`
+			Duration          int       `json:"duration"`
+			EscalationTime    int64     `json:"escalation_time"`
+			Region            string    `json:"region"`
+			ProductLine       string    `json:"product_line"`
+			Lvl2Team          string    `json:"lvl2_team"`
+			Lvl3Team          string    `json:"lvl3_team"`
+			Metric            string    `json:"metric"`
+			ServiceCmdbName   string    `json:"service_cmdb_name"`
+			Operator          string    `json:"operator"`
+			ReportURL         string    `json:"report_url"`
+			GroupName         string    `json:"group_name"`
+		}
+
+		var incident NocIncident
+
+		var subscription Subscription
+		err := c.BindJSON(&incident)
+		if err != nil {
+			logger.Println("Failed to parse subscription message:", err)
+			return
+		}
+		subscription.Topic = "noc_incident"
+		subscription.Message = incident
+		logger.Println(fmt.Sprintf("订阅消息：%s", subscription))
+		bus.Publish(WEBSOCKET_MESSAGE, subscription)
+		c.JSON(http.StatusOK, subscription)
+
+	})
+
 	router.POST("/wsapi", func(c *gin.Context) {
 
 		var subscription Subscription
