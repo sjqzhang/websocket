@@ -38,25 +38,23 @@ type Response struct {
 }
 
 type NocIncident struct {
-	ID              int                      `json:"id"`
-	IncidentID      string                   `json:"incident_id"`
-	Title           string                   `json:"title"`
-	StartTime       int64                    `json:"start_time"`
-	EndTime         int64                    `json:"end_time"`
-	Duration        int                      `json:"duration"`
-	EscalationTime  int64                    `json:"escalation_time"`
-	Region          []string                 `json:"region" gorm:"-"`
-	ProductLine     string                   `json:"product_line"`
-	Lvl2Team        string                   `json:"lvl2_team"`
-	Lvl3Team        string                   `json:"lvl3_team"`
-	Metric          string                   `json:"metric"`
-	Record          []map[string]interface{} `json:"record" gorm:"-"`
-	ServiceCmdbName string                   `json:"service_cmdb_name"`
-	Operator        string                   `json:"operator"`
-	ReportURL       string                   `json:"report_url"`
-	GroupName       string                   `json:"group_name"`
-	Records         string                   `json:"-" gorm:"records"`
-	Regions         string                   `json:"-" gorm:"regions"`
+	ID              int             `json:"id"`
+	IncidentID      string          `json:"incident_id"`
+	Title           string          `json:"title"`
+	StartTime       int64           `json:"start_time"`
+	EndTime         int64           `json:"end_time"`
+	Duration        int             `json:"duration"`
+	EscalationTime  int64           `json:"escalation_time"`
+	Region          json.RawMessage `json:"region" gorm:"region"`
+	ProductLine     string          `json:"product_line"`
+	Lvl2Team        string          `json:"lvl2_team"`
+	Lvl3Team        string          `json:"lvl3_team"`
+	Metric          string          `json:"metric"`
+	Record          json.RawMessage `json:"record" gorm:"record"`
+	ServiceCmdbName string          `json:"service_cmdb_name"`
+	Operator        string          `json:"operator"`
+	ReportURL       string          `json:"report_url"`
+	GroupName       string          `json:"group_name"`
 }
 
 func init() {
@@ -296,18 +294,6 @@ func main() {
 		if err != nil {
 			logger.Println("Failed to parse subscription message:", err)
 			return
-		}
-		if len(incident.Region) > 0 {
-			v, err := json.Marshal(incident.Region)
-			if err == nil {
-				incident.Regions = string(v)
-			}
-		}
-		if len(incident.Record) > 0 {
-			v, err := json.Marshal(incident.Record)
-			if err == nil {
-				incident.Regions = string(v)
-			}
 		}
 		var oldIncident NocIncident
 		if db.First(&oldIncident, "incident_id=?", incident.IncidentID).Error != nil {
