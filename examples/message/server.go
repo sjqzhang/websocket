@@ -130,6 +130,15 @@ func (h *hub) Run() {
 	for {
 		logger.Println("Goroutines", runtime.NumGoroutine(), "Cardinality", h.conns.Cardinality())
 		time.Sleep(time.Second * 10)
+		for _, c := range h.conns.ToSlice() {
+			c.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := c.(*websocket.Conn).WriteMessage(websocket.PingMessage, []byte{})
+			if err != nil {
+				if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
+					h.RemoveFailedConn(c.(*websocket.Conn))
+				}
+			}
+		}
 	}
 }
 
@@ -273,6 +282,7 @@ func main() {
 		c.JSON(200, Response{
 			Code: 200,
 			Data: incidents,
+			Msg:  "ok",
 		})
 
 	})
@@ -316,7 +326,7 @@ func main() {
 
 	})
 
-	router.POST("/wsapi", func(c *gin.Context) {
+	router.POST("/ws/api", func(c *gin.Context) {
 
 		var subscription Subscription
 		err := c.BindJSON(&subscription)
