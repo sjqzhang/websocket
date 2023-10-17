@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/alicebob/miniredis/v2"
 	mapset "github.com/deckarep/golang-set"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/jinzhu/gorm"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/sjqzhang/bus"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"io/ioutil"
@@ -24,8 +27,50 @@ const WEBSOCKET_MESSAGE = "WEBSOCKET_MESSAGE"
 var hubLocal = newHub()
 var logger *log.Logger
 
-func init() {
+var redisClient *miniredis.Miniredis
 
+var db *gorm.DB
+
+type Response struct {
+	Code int         `json:"code"`
+	Data interface{} `json:"data"`
+	Msg  string      `json:"message"`
+}
+
+type NocIncident struct {
+	ID              int                      `json:"id"`
+	IncidentID      string                   `json:"incident_id"`
+	Title           string                   `json:"title"`
+	StartTime       int64                    `json:"start_time"`
+	EndTime         int64                    `json:"end_time"`
+	Duration        int                      `json:"duration"`
+	EscalationTime  int64                    `json:"escalation_time"`
+	Region          []string                 `json:"region" gorm:"-"`
+	ProductLine     string                   `json:"product_line"`
+	Lvl2Team        string                   `json:"lvl2_team"`
+	Lvl3Team        string                   `json:"lvl3_team"`
+	Metric          string                   `json:"metric"`
+	Record          []map[string]interface{} `json:"record" gorm:"-"`
+	ServiceCmdbName string                   `json:"service_cmdb_name"`
+	Operator        string                   `json:"operator"`
+	ReportURL       string                   `json:"report_url"`
+	GroupName       string                   `json:"group_name"`
+	Records         string                   `json:"-" gorm:"records"`
+	Regions         string                   `json:"-" gorm:"regions"`
+}
+
+func init() {
+	var err error
+
+	db, err = gorm.Open("sqlite3", "test.db")
+	if err != nil {
+		panic(err)
+	}
+	db.AutoMigrate(&NocIncident{})
+	redisClient, err = miniredis.Run()
+	if err != nil {
+		panic(err)
+	}
 	bus.Subscribe(WEBSOCKET_MESSAGE, 50, func(ctx context.Context, message interface{}) {
 		if message == nil {
 			return
@@ -84,7 +129,7 @@ func (h *hub) SendMessage(subscription Subscription) {
 func (h *hub) Run() {
 	for {
 		logger.Println("Goroutines", runtime.NumGoroutine(), "Cardinality", h.conns.Cardinality())
-		time.Sleep(time.Second*10)
+		time.Sleep(time.Second * 10)
 	}
 }
 
@@ -218,27 +263,21 @@ func main() {
 		go readMessages(conn)
 	})
 
+	router.GET("/ws/noc_incident", func(c *gin.Context) {
+		var incidents []NocIncident
+		// 取当天的数据
+		today := time.Now().UTC()
+		todayStart := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+		tomorrowStart := todayStart.Add(24 * time.Hour)
+		db.Where("start_time >= ? AND start_time < ?", todayStart.Unix(), tomorrowStart.Unix()).Find(&incidents)
+		c.JSON(200, Response{
+			Code: 200,
+			Data: incidents,
+		})
+
+	})
+
 	router.POST("/ws/noc_incident", func(c *gin.Context) {
-
-
-		type NocIncident struct {
-			ID                int       `json:"id"`
-			IncidentID        string    `json:"incident_id"`
-			Title             string    `json:"title"`
-			StartTime         int64     `json:"start_time"`
-			EndTime           int64     `json:"end_time"`
-			Duration          int       `json:"duration"`
-			EscalationTime    int64     `json:"escalation_time"`
-			Region            string    `json:"region"`
-			ProductLine       string    `json:"product_line"`
-			Lvl2Team          string    `json:"lvl2_team"`
-			Lvl3Team          string    `json:"lvl3_team"`
-			Metric            string    `json:"metric"`
-			ServiceCmdbName   string    `json:"service_cmdb_name"`
-			Operator          string    `json:"operator"`
-			ReportURL         string    `json:"report_url"`
-			GroupName         string    `json:"group_name"`
-		}
 
 		var incident NocIncident
 
@@ -248,9 +287,30 @@ func main() {
 			logger.Println("Failed to parse subscription message:", err)
 			return
 		}
+		if len(incident.Region) > 0 {
+			v, err := json.Marshal(incident.Region)
+			if err == nil {
+				incident.Regions = string(v)
+			}
+		}
+		if len(incident.Record) > 0 {
+			v, err := json.Marshal(incident.Record)
+			if err == nil {
+				incident.Regions = string(v)
+			}
+		}
+		var oldIncident NocIncident
+		if db.First(&oldIncident, "incident_id=?", incident.IncidentID).Error != nil {
+			db.Create(&incident)
+		} else {
+			if oldIncident.ID != 0 {
+				incident.ID = oldIncident.ID
+				db.Save(incident)
+			}
+		}
 		subscription.Topic = "noc_incident"
 		subscription.Message = incident
-		logger.Println(fmt.Sprintf("订阅消息：%s", subscription))
+		logger.Println(fmt.Sprintf("订阅消息：%v", subscription))
 		bus.Publish(WEBSOCKET_MESSAGE, subscription)
 		c.JSON(http.StatusOK, subscription)
 
@@ -264,7 +324,7 @@ func main() {
 			logger.Println("Failed to parse subscription message:", err)
 			return
 		}
-		logger.Println(fmt.Sprintf("订阅消息：%s", subscription))
+		logger.Println(fmt.Sprintf("订阅消息：%v", subscription))
 		bus.Publish(WEBSOCKET_MESSAGE, subscription)
 		c.JSON(http.StatusOK, subscription)
 
