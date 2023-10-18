@@ -198,10 +198,12 @@ func readMessages(conn *websocket.Conn) {
 		//conn.SetReadDeadline(time.Now().Add(time.Second * 10))
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			if _, ok := err.(*websocket.CloseError); ok {
+			if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
 				hubLocal.RemoveFailedConn(conn)
 				return
 			}
+			logger.Println(fmt.Sprintf("ReadMessage Error:%v", err))
+			continue
 		}
 
 		switch messageType {
@@ -215,12 +217,12 @@ func readMessages(conn *websocket.Conn) {
 			var subscription Subscription
 			err = json.Unmarshal(message, &subscription)
 			if err != nil {
-				logger.Println("Failed to parse subscription message:", err)
+				logger.Println(fmt.Sprintf("Failed to parse subscription message:%v,err:%v", message, err))
 				continue
 			}
 			handleMessages(conn, subscription)
 
-			logger.Println("messageType", messageType, "message", message)
+			logger.Println(fmt.Sprintf("订阅消息:%v", subscription))
 
 		}
 
