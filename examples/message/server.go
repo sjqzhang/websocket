@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/alicebob/miniredis/v2"
@@ -15,9 +16,11 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -112,11 +115,9 @@ func (h *hub) SendMessage(subscription Subscription) {
 		for _, conn := range m.(mapset.Set).ToSlice() {
 			conn.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
 			err := conn.(*websocket.Conn).WriteJSON(subscription)
-			if err != nil {
-				if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
-					h.Unsubscribe(conn.(*websocket.Conn), subscription)
-					h.RemoveFailedConn(conn.(*websocket.Conn))
-				}
+			if isNetError(err) {
+				h.Unsubscribe(conn.(*websocket.Conn), subscription)
+				h.RemoveFailedConn(conn.(*websocket.Conn))
 			}
 
 		}
@@ -131,10 +132,8 @@ func (h *hub) Run() {
 		for _, c := range h.conns.ToSlice() {
 			c.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
 			err := c.(*websocket.Conn).WriteMessage(websocket.PingMessage, []byte{})
-			if err != nil {
-				if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
-					h.RemoveFailedConn(c.(*websocket.Conn))
-				}
+			if isNetError(err) {
+				h.RemoveFailedConn(c.(*websocket.Conn))
 			}
 		}
 	}
@@ -185,6 +184,31 @@ func (h *hub) RemoveFailedConn(conn *websocket.Conn) {
 	}()
 }
 
+func isNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
+		return true
+	}
+	if ne, ok := err.(*net.OpError); ok {
+		var se *os.SyscallError
+		if errors.As(ne, &se) {
+			seStr := strings.ToLower(se.Error())
+			if strings.Contains(seStr, "broken pipe") ||
+				strings.Contains(seStr, "connection reset by peer") {
+				return true
+			}
+		}
+	}
+	seStr := strings.ToLower(err.Error())
+	if strings.Contains(seStr, "broken pipe") ||
+		strings.Contains(seStr, "connection reset by peer") {
+		return true
+	}
+	return false
+}
+
 func readMessages(conn *websocket.Conn) {
 
 	defer func() {
@@ -198,7 +222,7 @@ func readMessages(conn *websocket.Conn) {
 		//conn.SetReadDeadline(time.Now().Add(time.Second * 10))
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			if _, ok := err.(*websocket.CloseError); ok || err == websocket.ErrCloseSent {
+			if isNetError(err) {
 				hubLocal.RemoveFailedConn(conn)
 				return
 			}
