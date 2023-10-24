@@ -299,15 +299,33 @@ func main() {
 	router.GET("/ws/noc_incident", func(c *gin.Context) {
 		var incidents []NocIncident
 		// 取当天的数据
-		today := time.Now().UTC()
-		todayStart := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
-		tomorrowStart := todayStart.Add(24 * time.Hour)
-		db.Where("start_time >= ? AND start_time < ?", todayStart.Unix(), tomorrowStart.Unix()).Find(&incidents)
-		c.JSON(200, Response{
-			Code: 200,
-			Data: incidents,
-			Msg:  "ok",
-		})
+		// 取过去24小时的数据
+
+		startTime := c.Query("start_time")
+
+		endTime := c.Query("end_time")
+
+		if startTime == "" {
+
+			today := time.Now().UTC()
+			todayStart := today.Add(time.Hour * -24)
+			db.Where("start_time >= ? AND start_time < ?", todayStart.Unix(), today.Unix()).Find(&incidents)
+			c.JSON(200, Response{
+				Code: 200,
+				Data: incidents,
+				Msg:  "ok",
+			})
+		} else {
+			if endTime == "" {
+				endTime = startTime
+			}
+			db.Where("start_time >= ? AND start_time < ?", startTime, endTime).Find(&incidents)
+			c.JSON(200, Response{
+				Code: 200,
+				Data: incidents,
+				Msg:  "ok",
+			})
+		}
 
 	})
 
