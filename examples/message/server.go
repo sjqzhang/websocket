@@ -12,14 +12,19 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/redis/go-redis/v9"
 	"github.com/sjqzhang/bus"
+	"github.com/spf13/viper"
 	"gopkg.in/natefinch/lumberjack.v2"
+	"gopkg.in/yaml.v3"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"runtime"
+
+	//"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,17 +32,26 @@ import (
 
 const WEBSOCKET_MESSAGE = "WEBSOCKET_MESSAGE"
 
-var hubLocal = newHub()
+var hubLocal *hub
 var logger *log.Logger
 
-var redisClient *miniredis.Miniredis
-
 var db *gorm.DB
+
+var config Config
+
+var rdb *redis.Client
+
+var rs *miniredis.Miniredis
 
 type Response struct {
 	Code int         `json:"code"`
 	Data interface{} `json:"data"`
 	Msg  string      `json:"message"`
+}
+
+type Conn struct {
+	sync.RWMutex
+	*websocket.Conn
 }
 
 type NocIncident struct {
@@ -60,24 +74,144 @@ type NocIncident struct {
 	GroupName       string          `json:"group_name"`
 }
 
-func init() {
-	var err error
+type Config struct {
+	Server struct {
+		Port int `mapstructure:"port" yaml:"port"`
+	} `yaml:"server"`
+	EmbedRedis struct {
+		Addr     string `mapstructure:"addr" yaml:"addr"`
+		Password string `mapstructure:"password" yaml:"password"`
+		DB       int    `mapstructure:"db" yaml:"db"`
+	} `yaml:"embedRedis"`
+	Database struct {
+		DbType string `mapstructure:"db_type" yaml:"db_type"`
+		Dsn    string `mapstructure:"dsn" yaml:"dsn"`
+	} `yaml:"database"`
+	Redis struct {
+		Addr     string `mapstructure:"addr" yaml:"addr"`
+		Password string `mapstructure:"password" yaml:"password"`
+		DB       int    `mapstructure:"db" yaml:"db"`
+	} `yaml:"redis"`
+}
 
-	db, err = gorm.Open("sqlite3", "test.db")
+func InitConfig() {
+	// 设置配置文件名称和路径
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+
+	// 读取配置文件
+	err := viper.ReadInConfig()
+	if err != nil {
+		fmt.Println("Failed to read configuration file:", err)
+
+		// 检查配置文件是否存在
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			// 如果配置文件不存在，则生成模板
+			config = Config{
+				Server: struct {
+					Port int `mapstructure:"port" yaml:"port"`
+				}{
+					Port: 8866,
+				},
+				EmbedRedis: struct {
+					Addr     string `mapstructure:"addr" yaml:"addr"`
+					Password string `mapstructure:"password" yaml:"password"`
+					DB       int    `mapstructure:"db" yaml:"db"`
+				}{
+					Addr:     ":6380",
+					Password: "",
+					DB:       0,
+				},
+				Database: struct {
+					DbType string `mapstructure:"db_type" yaml:"db_type"`
+					Dsn    string `mapstructure:"dsn" yaml:"dsn"`
+				}{
+					DbType: "sqlite3",
+					Dsn:    "test.db",
+				},
+				Redis: struct {
+					Addr     string `mapstructure:"addr" yaml:"addr"`
+					Password string `mapstructure:"password" yaml:"password"`
+					DB       int    `mapstructure:"db" yaml:"db"`
+				}{
+					Addr:     "127.0.0.1:6380",
+					Password: "",
+					DB:       0,
+				},
+			}
+
+			// 将配置数据转换为YAML格式
+			configBytes, err := yaml.Marshal(&config)
+			if err != nil {
+				fmt.Println("Failed to generate configuration template:", err)
+				return
+			}
+
+			// 将YAML数据写入配置文件
+			err = os.WriteFile("config.yaml", configBytes, 0644)
+			if err != nil {
+				fmt.Println("Failed to write configuration template:", err)
+				return
+			}
+
+			fmt.Println("Configuration file generated:", viper.ConfigFileUsed())
+			fmt.Println("Please configure the file and restart the application.")
+			return
+		}
+	}
+	err=viper.Unmarshal(&config)
 	if err != nil {
 		panic(err)
 	}
+
+}
+
+func InitHub() {
+	hubLocal = newHub()
+}
+
+func InitDB() {
+	var err error
+	db, err = gorm.Open(config.Database.DbType, config.Database.Dsn)
 	db.AutoMigrate(&NocIncident{})
-	redisClient, err = miniredis.Run()
 	if err != nil {
 		panic(err)
 	}
-	bus.Subscribe(WEBSOCKET_MESSAGE, 50, func(ctx context.Context, message interface{}) {
+
+}
+
+func InitRedis() {
+
+	rs = miniredis.NewMiniRedis()
+
+	rs.StartAddr(config.EmbedRedis.Addr)
+
+	if config.EmbedRedis.Password != "" {
+		rs.RequireAuth(config.EmbedRedis.Password)
+	}
+
+	rs.DB(config.EmbedRedis.DB)
+
+	if err := rs.Start(); err != nil {
+		panic(err)
+	}
+
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     config.Redis.Addr,
+		Password: config.Redis.Password,
+		DB:       config.Redis.DB,
+	})
+}
+
+func init() {
+
+	bus.Subscribe(WEBSOCKET_MESSAGE, 1, func(ctx context.Context, message interface{}) {
 		if message == nil {
 			return
 		}
 		if v, ok := message.(Subscription); ok {
-			hubLocal.SendMessage(v)
+			go hubLocal.SendMessage(v)
 		}
 	})
 }
@@ -91,33 +225,86 @@ var upgrader = websocket.Upgrader{
 
 // 订阅消息的结构体
 type Subscription struct {
-	Action  string      `json:"action"`
-	Topic   string      `json:"topic"`
-	ID      string      `json:"id"`
-	Message interface{} `json:"message"`
+	Action  string            `json:"action"`
+	Topic   string            `json:"topic"`
+	ID      string            `json:"id"`
+	Message interface{}       `json:"message"`
+	Header  map[string]string `json:"header"`
+}
+
+type Message struct {
+	Topic       string            `json:"topic"`
+	Message     interface{}       `json:"message"`
+	ID          string            `json:"id"`
+	CallbackURL string            `json:"callback_url"`
+	Header      map[string]string `json:"header"`
 }
 
 type hub struct {
-	subs  sync.Map
-	conns mapset.Set
+	subs        sync.Map
+	conns       mapset.Set
+	reqs        sync.Map
+	callbackURL string
 }
 
 func newHub() *hub {
+
+	getOutboundIP := func() (string, error) {
+		conn, err := net.Dial("udp", "8.8.8.8:80")
+		if err != nil {
+			return "", err
+		}
+		defer conn.Close()
+
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		return localAddr.IP.String(), nil
+	}
+
+	svcAddr, err := getOutboundIP()
+	if err != nil {
+		panic(err)
+	}
+	svcAddr = fmt.Sprintf("http://%s:%v/ws/api", svcAddr, config.Server.Port)
 	return &hub{
-		subs:  sync.Map{},
-		conns: mapset.NewSet(),
+		subs:        sync.Map{},
+		conns:       mapset.NewSet(),
+		reqs:        sync.Map{},
+		callbackURL: svcAddr,
 	}
 }
 
 func (h *hub) SendMessage(subscription Subscription) {
+	defer func() {
+		if err := recover(); err != nil {
+			panic(err)
+			log.Println(err)
+		}
+	}()
+	if subscription.Action == "response" {
+		if v, ok := h.reqs.Load(subscription.ID); ok {
+			v.(*Conn).Lock()
+			defer v.(*Conn).Unlock()
+			v.(*Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := v.(*Conn).WriteJSON(subscription)
+			fmt.Println(fmt.Sprintf("write:%v,err:%v", subscription, err))
+			if isNetError(err) {
+				h.RemoveFailedConn(v.(*Conn))
+			}
+		}
+		h.reqs.Delete(subscription.ID)
+		return
+	}
+
 	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		for _, conn := range m.(mapset.Set).ToSlice() {
-			conn.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
-			err := conn.(*websocket.Conn).WriteJSON(subscription)
+			conn.(*Conn).Lock()
+			conn.(*Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := conn.(*Conn).WriteJSON(subscription)
+			conn.(*Conn).Unlock()
 			if isNetError(err) {
-				h.Unsubscribe(conn.(*websocket.Conn), subscription)
-				h.RemoveFailedConn(conn.(*websocket.Conn))
+				h.Unsubscribe(conn.(*Conn), subscription)
+				h.RemoveFailedConn(conn.(*Conn))
 			}
 
 		}
@@ -129,17 +316,58 @@ func (h *hub) Run() {
 	for {
 		logger.Println("Goroutines", runtime.NumGoroutine(), "Cardinality", h.conns.Cardinality())
 		time.Sleep(time.Second * 10)
-		for _, c := range h.conns.ToSlice() {
-			c.(*websocket.Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
-			err := c.(*websocket.Conn).WriteMessage(websocket.PingMessage, []byte{})
+		pingFunc := func(c *Conn) {
+			c.Lock()
+			defer c.Unlock()
+			defer func() {
+				if err := recover(); err != nil {
+					log.Println(err)
+				}
+			}()
+			err := c.WriteMessage(websocket.PingMessage, []byte{})
 			if isNetError(err) {
-				h.RemoveFailedConn(c.(*websocket.Conn))
+				h.RemoveFailedConn(c)
 			}
+
+		}
+		for _, c := range h.conns.ToSlice() {
+			if v, ok := c.(*Conn); ok {
+				pingFunc(v)
+			}
+
 		}
 	}
 }
 
-func (h *hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
+func (h *hub) Subscribe(conn *Conn, subscription Subscription) {
+	if subscription.Action == "request" {
+		ctx := context.Background()
+		rdb.Pipelined(ctx, func(pipeliner redis.Pipeliner) error {
+			msg := Message{
+				Topic:       subscription.Topic,
+				Message:     subscription.Message,
+				ID:          subscription.ID,
+				CallbackURL: h.callbackURL,
+			}
+
+			data, err := json.Marshal(msg)
+			if err != nil {
+				logger.Println(err)
+				return err
+			}
+			topic := fmt.Sprintf("Topic_%s", subscription.Topic)
+			pipeliner.SAdd(ctx, "Topics", topic)
+			pipeliner.LPush(ctx, subscription.Topic, data)
+			pipeliner.Publish(ctx, topic, "")
+			pipeliner.LTrim(ctx, subscription.Topic, 0, 100000)
+			if _, err := pipeliner.Exec(ctx); err == nil {
+				h.reqs.Store(subscription.ID, conn)
+			}
+			return nil
+		})
+		return
+	}
+
 	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Add(conn)
@@ -153,7 +381,8 @@ func (h *hub) Subscribe(conn *websocket.Conn, subscription Subscription) {
 }
 
 // unsubscribe from a topic
-func (h *hub) Unsubscribe(conn *websocket.Conn, subscription Subscription) {
+func (h *hub) Unsubscribe(conn *Conn, subscription Subscription) {
+	fmt.Println("closing", conn.RemoteAddr())
 	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		m.(mapset.Set).Remove(conn)
@@ -166,11 +395,11 @@ func (h *hub) Unsubscribe(conn *websocket.Conn, subscription Subscription) {
 }
 
 // unsubscribe from a topic
-func (h *hub) RemoveFailedConn(conn *websocket.Conn) {
+func (h *hub) RemoveFailedConn(conn *Conn) {
 	go func() {
 		h.subs.Range(func(key, value interface{}) bool {
 			for _, con := range value.(mapset.Set).ToSlice() {
-				c := con.(*websocket.Conn)
+				c := con.(*Conn)
 				if c == conn {
 					if m, ok := h.subs.Load(key); ok {
 						m.(mapset.Set).Remove(conn)
@@ -209,7 +438,7 @@ func isNetError(err error) bool {
 	return false
 }
 
-func readMessages(conn *websocket.Conn) {
+func readMessages(conn *Conn) {
 
 	defer func() {
 		if err := recover(); err != nil {
@@ -220,7 +449,9 @@ func readMessages(conn *websocket.Conn) {
 	for {
 		// 读取客户端发来的消息
 		//conn.SetReadDeadline(time.Now().Add(time.Second * 10))
+		conn.RLock()
 		messageType, message, err := conn.ReadMessage()
+		conn.RUnlock()
 		if err != nil {
 			if isNetError(err) {
 				hubLocal.RemoveFailedConn(conn)
@@ -253,13 +484,18 @@ func readMessages(conn *websocket.Conn) {
 	}
 }
 
-func handleMessages(conn *websocket.Conn, subscription Subscription) {
+func handleMessages(conn *Conn, subscription Subscription) {
 	hubLocal.Subscribe(conn, subscription)
 } // 获取订阅
 
 var addr = flag.String("addr", ":8866", "http service address")
 
 func main() {
+
+	InitConfig()
+	InitDB()
+	InitRedis()
+	InitHub()
 
 	logFile := &lumberjack.Logger{
 		Filename:   "gin.log", // 日志文件名称
@@ -293,7 +529,11 @@ func main() {
 			logger.Println("Failed to upgrade connection:", err)
 			return
 		}
-		go readMessages(conn)
+		con := &Conn{
+			Conn:    conn,
+			RWMutex: sync.RWMutex{},
+		}
+		go readMessages(con)
 	})
 
 	router.GET("/ws/noc_incident", func(c *gin.Context) {
@@ -370,6 +610,6 @@ func main() {
 
 	})
 
-	router.Run(*addr)
+	router.Run(fmt.Sprintf(":%v", config.Server.Port))
 
 }
