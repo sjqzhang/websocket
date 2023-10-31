@@ -24,7 +24,6 @@ import (
 	"os"
 	"runtime"
 
-	//"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +43,7 @@ var rdb *redis.Client
 var rs *miniredis.Miniredis
 
 type Response struct {
-	Code int         `json:"code"`
+	Code int         `json:"retcode"`
 	Data interface{} `json:"data"`
 	Msg  string      `json:"message"`
 }
@@ -52,6 +51,51 @@ type Response struct {
 type Conn struct {
 	sync.RWMutex
 	*websocket.Conn
+	send chan []byte
+}
+
+type CommonMap struct {
+	sync.RWMutex
+	m map[string]interface{}
+}
+
+func NewCommonMap() *CommonMap {
+	return &CommonMap{
+		m: make(map[string]interface{}),
+	}
+}
+
+func (m *CommonMap) Store(key string, value interface{}) {
+	m.Lock()
+	defer m.Unlock()
+	m.m[key] = value
+}
+
+// remove
+func (m *CommonMap) Delete(key string) {
+	m.Lock()
+	defer m.Unlock()
+	delete(m.m, key)
+}
+
+// get
+func (m *CommonMap) Load(key string) (interface{}, bool) {
+	m.RLock()
+	defer m.RUnlock()
+	v, ok := m.m[key]
+	return v, ok
+}
+
+// get all from copy
+
+func (m *CommonMap) LoadAll() map[string]interface{} {
+	m.RLock()
+	defer m.RUnlock()
+	r := make(map[string]interface{})
+	for k, v := range m.m {
+		r[k] = v
+	}
+	return r
 }
 
 type NocIncident struct {
@@ -160,7 +204,7 @@ func InitConfig() {
 			return
 		}
 	}
-	err=viper.Unmarshal(&config)
+	err = viper.Unmarshal(&config)
 	if err != nil {
 		panic(err)
 	}
@@ -241,9 +285,10 @@ type Message struct {
 }
 
 type hub struct {
-	subs        sync.Map
-	conns       mapset.Set
-	reqs        sync.Map
+	subs  *CommonMap
+	conns mapset.Set
+	//reqs        sync.Map
+	reqs        *CommonMap
 	callbackURL string
 }
 
@@ -266,9 +311,9 @@ func newHub() *hub {
 	}
 	svcAddr = fmt.Sprintf("http://%s:%v/ws/api", svcAddr, config.Server.Port)
 	return &hub{
-		subs:        sync.Map{},
+		subs:        NewCommonMap(),
 		conns:       mapset.NewSet(),
-		reqs:        sync.Map{},
+		reqs:        NewCommonMap(),
 		callbackURL: svcAddr,
 	}
 }
@@ -276,37 +321,32 @@ func newHub() *hub {
 func (h *hub) SendMessage(subscription Subscription) {
 	defer func() {
 		if err := recover(); err != nil {
-			panic(err)
 			log.Println(err)
 		}
 	}()
 	if subscription.Action == "response" {
+		defer h.reqs.Delete(subscription.ID)
 		if v, ok := h.reqs.Load(subscription.ID); ok {
-			v.(*Conn).Lock()
-			defer v.(*Conn).Unlock()
-			v.(*Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
-			err := v.(*Conn).WriteJSON(subscription)
-			fmt.Println(fmt.Sprintf("write:%v,err:%v", subscription, err))
-			if isNetError(err) {
-				h.RemoveFailedConn(v.(*Conn))
+			//v.(*Conn).Lock()
+			//defer v.(*Conn).Unlock()
+
+			data, err := json.Marshal(subscription)
+			if err != nil {
+				return
 			}
+			v.(*Conn).send <- data
 		}
-		h.reqs.Delete(subscription.ID)
 		return
 	}
 
 	key := fmt.Sprintf("%s_$_%s", subscription.Topic, subscription.ID)
 	if m, ok := h.subs.Load(key); ok {
 		for _, conn := range m.(mapset.Set).ToSlice() {
-			conn.(*Conn).Lock()
-			conn.(*Conn).SetWriteDeadline(time.Now().Add(time.Second * 2))
-			err := conn.(*Conn).WriteJSON(subscription)
-			conn.(*Conn).Unlock()
-			if isNetError(err) {
-				h.Unsubscribe(conn.(*Conn), subscription)
-				h.RemoveFailedConn(conn.(*Conn))
+			data, err := json.Marshal(subscription)
+			if err != nil {
+				return
 			}
-
+			conn.(*Conn).send <- data
 		}
 	}
 
@@ -348,6 +388,7 @@ func (h *hub) Subscribe(conn *Conn, subscription Subscription) {
 				Message:     subscription.Message,
 				ID:          subscription.ID,
 				CallbackURL: h.callbackURL,
+				Header:      subscription.Header,
 			}
 
 			data, err := json.Marshal(msg)
@@ -359,7 +400,7 @@ func (h *hub) Subscribe(conn *Conn, subscription Subscription) {
 			pipeliner.SAdd(ctx, "Topics", topic)
 			pipeliner.LPush(ctx, subscription.Topic, data)
 			pipeliner.Publish(ctx, topic, "")
-			pipeliner.LTrim(ctx, subscription.Topic, 0, 100000)
+			pipeliner.LTrim(ctx, subscription.Topic, 0, 1000)
 			if _, err := pipeliner.Exec(ctx); err == nil {
 				h.reqs.Store(subscription.ID, conn)
 			}
@@ -397,19 +438,22 @@ func (h *hub) Unsubscribe(conn *Conn, subscription Subscription) {
 // unsubscribe from a topic
 func (h *hub) RemoveFailedConn(conn *Conn) {
 	go func() {
-		h.subs.Range(func(key, value interface{}) bool {
-			for _, con := range value.(mapset.Set).ToSlice() {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Println(err)
+			}
+		}()
+		for k, v := range h.subs.LoadAll() {
+			for _, con := range v.(mapset.Set).ToSlice() {
 				c := con.(*Conn)
 				if c == conn {
-					if m, ok := h.subs.Load(key); ok {
+					if m, ok := v.(mapset.Set); ok {
 						m.(mapset.Set).Remove(conn)
-						h.subs.Store(key, m)
+						h.subs.Store(k, m)
 					}
 				}
 			}
-			return true
-		})
-		h.conns.Remove(conn)
+		}
 	}()
 }
 
@@ -448,7 +492,7 @@ func readMessages(conn *Conn) {
 	defer conn.Close()
 	for {
 		// 读取客户端发来的消息
-		//conn.SetReadDeadline(time.Now().Add(time.Second * 10))
+		conn.SetReadDeadline(time.Now().Add(time.Second * 10))
 		conn.RLock()
 		messageType, message, err := conn.ReadMessage()
 		conn.RUnlock()
@@ -482,6 +526,35 @@ func readMessages(conn *Conn) {
 		}
 
 	}
+}
+
+func writeMessages(con *Conn) {
+	tick := time.NewTicker(time.Second * 10)
+	for {
+		select {
+		case message, ok := <-con.send:
+			if !ok {
+				return
+			}
+			con.Lock()
+			con.SetWriteDeadline(time.Now().Add(time.Second * 2))
+			err := con.WriteMessage(websocket.TextMessage, message)
+			con.Unlock()
+			if isNetError(err) {
+				hubLocal.RemoveFailedConn(con)
+			}
+		case <-tick.C:
+			//ping current connection
+			con.Lock()
+			err := con.WriteMessage(websocket.PingMessage, []byte{})
+			con.Unlock()
+			if isNetError(err) {
+				hubLocal.RemoveFailedConn(con)
+			}
+
+		}
+	}
+
 }
 
 func handleMessages(conn *Conn, subscription Subscription) {
@@ -522,7 +595,6 @@ func main() {
 		c.Writer.Write(body)
 
 	})
-
 	router.GET("/ws", func(c *gin.Context) {
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -532,8 +604,10 @@ func main() {
 		con := &Conn{
 			Conn:    conn,
 			RWMutex: sync.RWMutex{},
+			send:    make(chan []byte, 1000),
 		}
 		go readMessages(con)
+		go writeMessages(con)
 	})
 
 	router.GET("/ws/noc_incident", func(c *gin.Context) {
@@ -551,7 +625,7 @@ func main() {
 			todayStart := today.Add(time.Hour * -24)
 			db.Where("start_time >= ? AND start_time < ?", todayStart.Unix(), today.Unix()).Find(&incidents)
 			c.JSON(200, Response{
-				Code: 200,
+				Code: 0,
 				Data: incidents,
 				Msg:  "ok",
 			})
@@ -561,7 +635,7 @@ func main() {
 			}
 			db.Where("start_time >= ? AND start_time < ?", startTime, endTime).Find(&incidents)
 			c.JSON(200, Response{
-				Code: 200,
+				Code: 0,
 				Data: incidents,
 				Msg:  "ok",
 			})
@@ -592,7 +666,11 @@ func main() {
 		subscription.Message = incident
 		logger.Println(fmt.Sprintf("订阅消息：%v", subscription))
 		bus.Publish(WEBSOCKET_MESSAGE, subscription)
-		c.JSON(http.StatusOK, subscription)
+		c.JSON(http.StatusOK, Response{
+			Code: 0,
+			Data: subscription,
+			Msg:  "ok",
+		})
 
 	})
 
@@ -606,7 +684,11 @@ func main() {
 		}
 		logger.Println(fmt.Sprintf("订阅消息：%v", subscription))
 		bus.Publish(WEBSOCKET_MESSAGE, subscription)
-		c.JSON(http.StatusOK, subscription)
+		c.JSON(http.StatusOK, Response{
+			Code: 0,
+			Data: subscription,
+			Msg:  "ok",
+		})
 
 	})
 
